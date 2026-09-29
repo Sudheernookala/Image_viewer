@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Acme PLM – iframe integration demo</title>
+<style>
+  :root { --b: #d9dee7; --muted: #667085; --accent: #1f6feb; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.4 system-ui, sans-serif; color: #1d2433; background: #f4f6f9; height: 100vh; display: flex; flex-direction: column; }
+  header { background: #0f2a4a; color: #fff; padding: 10px 16px; display: flex; gap: 12px; align-items: baseline; }
+  header b { font-size: 15px; } header span { opacity: .7; }
+  main { flex: 1; display: grid; grid-template-columns: 300px 1fr 340px; gap: 10px; padding: 10px; min-height: 0; }
+  section { background: #fff; border: 1px solid var(--b); border-radius: 8px; display: flex; flex-direction: column; min-height: 0; }
+  h3 { margin: 0; padding: 9px 12px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); border-bottom: 1px solid var(--b); }
+  .scroll { overflow: auto; flex: 1; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { padding: 6px 10px; border-bottom: 1px solid #eef0f4; text-align: left; white-space: nowrap; }
+  th { position: sticky; top: 0; background: #fafbfc; font-weight: 600; color: var(--muted); font-size: 11px; }
+  tr.row { cursor: pointer; } tr.row:hover { background: #f1f5fd; } tr.active { background: #dce9ff !important; }
+  .state { font-size: 11px; padding: 1px 6px; border-radius: 10px; color: #fff; }
+  .Released { background: #2e9e5b; } .In.Work, .InWork { background: #e3a008; } .InReview { background: #3b82f6; } .Obsolete { background: #8a8f98; }
+  iframe { border: 0; width: 100%; flex: 1; border-radius: 0 0 8px 8px; }
+  .actions { display: flex; gap: 6px; padding: 8px; flex-wrap: wrap; border-bottom: 1px solid var(--b); }
+  button { border: 1px solid var(--b); background: #fff; border-radius: 6px; padding: 5px 9px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  .detail { padding: 10px 12px; border-bottom: 1px solid var(--b); min-height: 92px; }
+  .detail .k { color: var(--muted); display: inline-block; width: 90px; }
+  #log { font: 11px/1.5 ui-monospace, monospace; padding: 8px 12px; color: #394150; max-height: 170px; overflow: auto; border-top: 1px solid var(--b); }
+  #snap { max-width: 100%; display: none; border-top: 1px solid var(--b); }
+</style>
+</head>
+<body>
+<header><b>Acme PLM</b><span>Demo host application — the 3D viewer is embedded with an &lt;iframe&gt; and driven with postMessage</span></header>
+<main>
+  <section>
+    <h3>Items (from PLM)</h3>
+    <div class="scroll"><table><thead><tr><th>Number</th><th>Title</th><th>Rev</th><th>State</th></tr></thead><tbody id="items"></tbody></table></div>
+  </section>
+
+  <section>
+    <h3 id="viewerTitle">3D view</h3>
+    <div class="actions">
+      <button id="byState">Colour by lifecycle state</button>
+      <button id="reset">Reset colours</button>
+      <button id="inwork">Isolate “In Work” parts</button>
+      <button id="all">Show all</button>
+      <button id="cut">Section cut</button>
+      <button id="snapBtn">Snapshot → change request</button>
+    </div>
+    <iframe id="viewer" allow="fullscreen"></iframe>
+  </section>
+
+  <section>
+    <h3>Selected part</h3>
+    <div class="detail" id="detail">Click a part in 3D or a BOM line.</div>
+    <h3>BOM</h3>
+    <div class="scroll"><table><thead><tr><th>Number</th><th>Title</th><th>State</th></tr></thead><tbody id="bom"></tbody></table></div>
+    <img id="snap" alt="snapshot" />
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+  // The viewer server. When this page is served by the viewer itself it is the same origin;
+  // pass ?viewer=https://viewer.example.com to test a real cross-origin setup.
+  const VIEWER = new URLSearchParams(location.search).get('viewer') || location.origin
+  const PLM_API = VIEWER + '/mock-plm/api'          // the "PLM" this portal belongs to
+  const PLM_HEADERS = { Authorization: 'Bearer demo-token' }
+  const stateColors = { Released: '#2e9e5b', 'In Work': '#e3a008', 'In Review': '#3b82f6', Obsolete: '#8a8f98' }
+  const $ = (id) => document.getElementById(id)
+  const log = (m) => { $('log').insertAdjacentHTML('afterbegin', `<div>${new Date().toLocaleTimeString()} ${m}</div>`) }
+  let bom = []
+
+  const s = document.createElement('script')
+  s.src = VIEWER + '/sdk/cad-viewer-host.js'
+  s.onload = start
+  document.head.appendChild(s)
+
+  async function start() {
+    const iframe = $('viewer')
+    iframe.src = VIEWER + '/embed.html?ui=compact'
+    const viewer = new CadViewerFrame(iframe)
+    window.viewer = viewer // for experimenting in the console
+
+    viewer.on('loadstart', () => log('loading…'))
+    viewer.on('load', (r) => log(`loaded ${r.stats.files.map((f) => f.name).join(', ')} — ${r.stats.meshes} parts, ${r.stats.triangles.toLocaleString()} triangles`))
+    viewer.on('error', (e) => log('<b style="color:#c00">error</b> ' + e.message))
+    viewer.on('select', ({ part }) => showPart(part && part.name))
+
+    await viewer.ready
+    log('viewer ready (' + viewer.info.methods.length + ' API methods)')
+
+    // Items list comes from the PLM's own API.
+    const items = (await (await fetch(PLM_API + '/parts', { headers: PLM_HEADERS })).json()).items
+    $('items').innerHTML = items.map((p) => `<tr class="row" data-n="${p.number}"><td>${p.number}</td><td>${p.title}</td><td>${p.revision}</td><td><span class="state ${p.state.replace(' ', '')}">${p.state}</span></td></tr>`).join('')
+    $('items').onclick = (e) => { const tr = e.target.closest('tr'); if (tr) openItem(tr.dataset.n, items) }
+
+    // BOM line -> select + zoom in 3D
+    $('bom').onclick = (e) => {
+      const tr = e.target.closest('tr'); if (!tr) return
+      viewer.select(tr.dataset.cad); viewer.zoomTo(tr.dataset.cad); showPart(tr.dataset.cad)
+    }
+    $('byState').onclick = () => {
+      const map = {}; bom.forEach((b) => (map[b.cadName] = stateColors[b.state])); viewer.colorize(map)
+    }
+    $('reset').onclick = () => viewer.resetColors()
+    $('inwork').onclick = () => viewer.isolate(bom.filter((b) => b.state === 'In Work').map((b) => b.cadName))
+    $('all').onclick = () => { viewer.showAll(); viewer.fit() }
+    let cut = false
+    $('cut').onclick = () => { cut = !cut; viewer.setSection('y', { enabled: cut, t: 0.5 }) }
+    $('snapBtn').onclick = async () => {
+      const png = await viewer.screenshot()
+      $('snap').src = png; $('snap').style.display = 'block'
+      log(`snapshot ${(png.length / 1024).toFixed(0)} KB ready to attach to a change request`)
+    }
+
+    openItem('CAR-0001', items)
+  }
+
+  async function openItem(number, items) {
+    document.querySelectorAll('#items tr').forEach((tr) => tr.classList.toggle('active', tr.dataset.n === number))
+    const item = items.find((i) => i.number === number)
+    $('viewerTitle').textContent = `3D view — ${number} ${item ? item.title : ''} (rev ${item ? item.revision : ''})`
+    // The viewer fetches the CAD file through its "plm" connector; the PLM token never reaches the browser.
+    viewer.openFromSource('plm', number).catch(() => {})
+    bom = (await (await fetch(`${PLM_API}/parts/${number}/bom`, { headers: PLM_HEADERS })).json()).items
+    $('bom').innerHTML = bom.length
+      ? bom.map((b) => `<tr class="row" data-cad="${b.cadName}"><td>${b.number}</td><td>${b.title}</td><td><span class="state ${b.state.replace(' ', '')}">${b.state}</span></td></tr>`).join('')
+      : '<tr><td colspan="3" style="color:#667085">No BOM for this item</td></tr>'
+    showPart(null)
+  }
+
+  function showPart(cadName) {
+    document.querySelectorAll('#bom tr').forEach((tr) => tr.classList.toggle('active', !!cadName && tr.dataset.cad === cadName))
+    const line = bom.find((b) => b.cadName === cadName)
+    const row = document.querySelector(`#bom tr[data-cad="${cadName}"]`)
+    if (row) row.scrollIntoView({ block: 'nearest' })
+    $('detail').innerHTML = !cadName ? 'Click a part in 3D or a BOM line.'
+      : line ? `<div><span class="k">Part number</span><b>${line.number}</b></div><div><span class="k">Title</span>${line.title}</div>
+                <div><span class="k">Revision</span>${line.revision}</div><div><span class="k">State</span><span class="state ${line.state.replace(' ', '')}">${line.state}</span></div>
+                <div><span class="k">CAD name</span>${line.cadName}</div>`
+      : `<div><span class="k">CAD name</span>${cadName}</div><div style="color:#667085">Not linked to a PLM item.</div>`
+    if (cadName) log('selected ' + cadName)
+  }
+</script>
+</body>
+</html>

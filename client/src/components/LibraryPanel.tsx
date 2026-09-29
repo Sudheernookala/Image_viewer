@@ -1,93 +1,123 @@
 import { useCallback, useEffect, useState } from 'react'
 import { deleteLocal, listLocal, type LocalEntry } from '../lib/localDb'
-import { deleteServer, listServer, type ServerModel } from '../lib/serverApi'
+import { listModels, listSources, remove, type ServerModel, type SourceInfo } from '../lib/serverApi'
 import { formatBytes } from '../lib/files'
 import { Icon } from './Icon'
 
 interface Props {
-  onOpenServer: (m: ServerModel) => void
+  onOpenServer: (source: string, m: ServerModel) => void
   onOpenLocal: (e: LocalEntry) => void
   refreshKey: number
+  showRecent: boolean
 }
 
-export function LibraryPanel({ onOpenServer, onOpenLocal, refreshKey }: Props) {
-  const [tab, setTab] = useState<'server' | 'local'>('server')
-  const [server, setServer] = useState<ServerModel[]>([])
+/** Browses every model source the server exposes (its own DB + PLM / document connectors). */
+export function LibraryPanel({ onOpenServer, onOpenLocal, refreshKey, showRecent }: Props) {
+  const [sources, setSources] = useState<SourceInfo[]>([])
+  const [source, setSource] = useState<string>('local')
+  const [models, setModels] = useState<ServerModel[]>([])
   const [local, setLocal] = useState<LocalEntry[]>([])
   const [error, setError] = useState<string | null>(null)
   const [q, setQ] = useState('')
 
+  useEffect(() => {
+    listSources()
+      .then(setSources)
+      .catch(() => setSources([]))
+  }, [refreshKey])
+
   const refresh = useCallback(async () => {
     setError(null)
-    try {
-      setLocal(await listLocal())
-    } catch {
-      setLocal([])
+    if (source === '__recent') {
+      setLocal(await listLocal().catch(() => []))
+      return
     }
     try {
-      setServer(await listServer(q))
-    } catch {
-      setServer([])
-      setError('Server database not reachable. Start it with "npm run dev" in the project root.')
+      setModels(await listModels(source, q))
+    } catch (e) {
+      setModels([])
+      setError(`Cannot reach "${source}": ${(e as Error).message || 'server not running'}`)
     }
-  }, [q])
+  }, [source, q])
 
   useEffect(() => {
-    refresh()
-  }, [refresh, refreshKey])
+    const t = setTimeout(refresh, q ? 250 : 0) // debounce search
+    return () => clearTimeout(t)
+  }, [refresh, refreshKey, q])
 
-  const groups = server.reduce<Record<string, ServerModel[]>>((acc, m) => {
+  const current = sources.find((s) => s.id === source)
+  const groups = models.reduce<Record<string, ServerModel[]>>((acc, m) => {
     ;(acc[m.category || 'Other'] ??= []).push(m)
     return acc
   }, {})
 
   return (
     <div className="library">
-      <div className="tabs small">
-        <button className={tab === 'server' ? 'active' : ''} onClick={() => setTab('server')}>
-          Server DB ({server.length})
-        </button>
-        <button className={tab === 'local' ? 'active' : ''} onClick={() => setTab('local')}>
-          Recent ({local.length})
-        </button>
+      <div className="source-bar">
+        <select value={source} onChange={(e) => setSource(e.target.value)} title="Model source">
+          {sources.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+          {!sources.length && <option value="local">Viewer database</option>}
+          {showRecent && <option value="__recent">Recent (this browser)</option>}
+        </select>
         <button className="icon-btn" title="Refresh" onClick={refresh}>
           <Icon name="refresh" size={14} />
         </button>
       </div>
-      {tab === 'server' && (
+      {source !== '__recent' && (
         <>
-          <input className="search" placeholder="Search database…" value={q} onChange={(e) => setQ(e.target.value)} />
+          <input className="search" placeholder="Search name, part number, state…" value={q} onChange={(e) => setQ(e.target.value)} />
           {error && <div className="note warn">{error}</div>}
           <div className="lib-scroll">
             {Object.entries(groups).map(([cat, items]) => (
               <div key={cat}>
                 <div className="lib-cat">{cat}</div>
                 {items.map((m) => (
-                  <div key={m.id} className="lib-item" onClick={() => onOpenServer(m)} title={m.description || m.name}>
+                  <div key={m.id} className="lib-item" onClick={() => onOpenServer(source, m)} title={m.description || m.name}>
                     <span className="badge">{m.format}</span>
-                    <span className="lib-name">{m.name}</span>
-                    <span className="lib-size">{formatBytes(m.size)}</span>
-                    <button
-                      className="icon-btn"
-                      title="Delete from database"
-                      onClick={async (e) => {
-                        e.stopPropagation()
-                        if (confirm(`Delete ${m.name} from the server database?`)) {
-                          await deleteServer(m.id)
-                          refresh()
-                        }
-                      }}
-                    >
-                      <Icon name="trash" size={13} />
-                    </button>
+                    <span className="lib-name">
+                      {m.name}
+                      {m.extra && (
+                        <span className="lib-meta">
+                          {Object.entries(m.extra)
+                            .filter(([, v]) => v !== null && v !== undefined && v !== '')
+                            .slice(0, 3)
+                            .map(([k, v]) => (
+                              <span key={k} title={k}>
+                                {String(v)}
+                              </span>
+                            ))}
+                        </span>
+                      )}
+                    </span>
+                    <span className="lib-size">{m.size ? formatBytes(m.size) : ''}</span>
+                    {current?.canUpload && (
+                      <button
+                        className="icon-btn"
+                        title="Delete from database"
+                        onClick={async (e) => {
+                          e.stopPropagation()
+                          if (confirm(`Delete ${m.name}?`)) {
+                            await remove(source, m.id)
+                            refresh()
+                          }
+                        }}
+                      >
+                        <Icon name="trash" size={13} />
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>
             ))}
+            {!error && !models.length && <div className="empty">No models found.</div>}
           </div>
         </>
       )}
-      {tab === 'local' && (
+      {source === '__recent' && (
         <div className="lib-scroll">
           {!local.length && <div className="empty">Files you open are cached here (IndexedDB, this browser only).</div>}
           {local.map((e) => (

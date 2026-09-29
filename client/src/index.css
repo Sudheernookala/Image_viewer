@@ -1,4 +1,5 @@
-:root {
+:root,
+:host {
   --bg: #12151c;
   --panel: #191d26;
   --panel-2: #20252f;
@@ -218,3 +219,11 @@ input[type='checkbox'] { accent-color: var(--accent); }
   .panel.left { left: 0; }
   .panel.right { right: 0; }
 }
+
+/* library sources */
+.source-bar { display: flex; gap: 4px; padding: 6px 6px 0; align-items: center; }
+.source-bar select { flex: 1; }
+.lib-name { display: flex; flex-direction: column; min-width: 0; }
+.lib-meta { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 2px; }
+.lib-meta span { font-size: 10px; color: #a9b4c6; background: #262d3a; border-radius: 3px; padding: 0 4px; }
+.app:focus { outline: none; }

@@ -178,8 +178,11 @@ export class Viewer {
     el.addEventListener('pointermove', this.onPointerMove)
     el.addEventListener('dblclick', this.onDoubleClick)
     el.addEventListener('wheel', this.onWheel, { passive: false })
-    window.addEventListener('keydown', this.onKeyDown)
-    window.addEventListener('keyup', this.onKeyUp)
+    // Keys are scoped to the viewer element, never window: an embedded viewer must not steal the host app's shortcuts.
+    container.tabIndex = container.tabIndex >= 0 ? container.tabIndex : 0
+    container.addEventListener('keydown', this.onKeyDown)
+    container.addEventListener('keyup', this.onKeyUp)
+    container.addEventListener('blur', () => this.keys.clear())
 
     this.resizeObs = new ResizeObserver(() => this.resize())
     this.resizeObs.observe(container)
@@ -799,6 +802,63 @@ export class Viewer {
     this.requestRender()
   }
 
+  /** Shows only the given parts/assemblies (and their parents) and frames them. */
+  isolateMany(ids: number[]) {
+    const targets = ids.map((i) => this.byId(i)).filter(Boolean) as THREE.Object3D[]
+    if (!targets.length) return
+    this.content.traverse((o) => {
+      if (o === this.content || o.userData.__helper) return
+      o.visible = targets.some((t) => isDescendant(o, t) || isDescendant(t, o))
+    })
+    this.fit(targets)
+    this.emit('tree')
+    this.requestRender()
+  }
+
+  /** Flat list of every node (assemblies and parts) — handy for mapping to PLM item numbers. */
+  getParts(): { id: number; name: string; path: string; isMesh: boolean; visible: boolean }[] {
+    const out: { id: number; name: string; path: string; isMesh: boolean; visible: boolean }[] = []
+    const walk = (o: THREE.Object3D, path: string) => {
+      if (o.userData.__helper) return
+      const name = o.name || o.type
+      const isMesh = !!(o as THREE.Mesh).isMesh || !!(o as THREE.Points).isPoints
+      out.push({ id: o.id, name, path, isMesh, visible: isVisible(o) })
+      const p = path ? `${path}/${name}` : name
+      o.children.forEach((c) => walk(c, p))
+    }
+    this.models.forEach((m) => walk(m.object, ''))
+    return out
+  }
+
+  /** Overrides part colours, e.g. to show PLM lifecycle state. Assemblies colour all their parts. */
+  colorize(entries: { id: number; color: string; opacity?: number }[]) {
+    for (const { id, color, opacity } of entries) {
+      const o = this.byId(id)
+      if (!o) continue
+      const mat = overrideMaterial(color, opacity ?? 1)
+      o.traverse((c) => {
+        const m = c as THREE.Mesh
+        if (!m.isMesh || m.userData.__helper) return
+        if (!m.userData.__baseMat) m.userData.__baseMat = m === this.selected ? m.userData.__origMat : m.material
+        if (m === this.selected) m.userData.__origMat = mat
+        else m.material = mat
+      })
+    }
+    this.applyDisplayMode()
+    this.applySection()
+  }
+
+  resetColors() {
+    for (const m of this.meshes) {
+      if (!m.userData.__baseMat) continue
+      if (m === this.selected) m.userData.__origMat = m.userData.__baseMat
+      else m.material = m.userData.__baseMat
+      delete m.userData.__baseMat
+    }
+    this.applyDisplayMode()
+    this.applySection()
+  }
+
   showAll() {
     this.content.traverse((o) => {
       if (!o.userData.__helper || this.displayMode === 'edges' || this.displayMode === 'xray') o.visible = true
@@ -901,6 +961,7 @@ export class Viewer {
   }
 
   private onPointerDown = (ev: PointerEvent) => {
+    this.container.focus({ preventScroll: true })
     this.downPos = { x: ev.clientX, y: ev.clientY }
     this.animId++ // cancel camera animation
   }
@@ -1097,14 +1158,36 @@ export class Viewer {
   dispose() {
     cancelAnimationFrame(this.raf)
     this.resizeObs.disconnect()
-    window.removeEventListener('keydown', this.onKeyDown)
-    window.removeEventListener('keyup', this.onKeyUp)
+    this.container.removeEventListener('keydown', this.onKeyDown)
+    this.container.removeEventListener('keyup', this.onKeyUp)
     this.clearModels(false)
     this.controls.dispose()
     this.renderer.dispose()
     this.renderer.domElement.remove()
     this.labelRenderer.domElement.remove()
   }
+}
+
+const overrideCache = new Map<string, THREE.MeshStandardMaterial>()
+function overrideMaterial(color: string, opacity: number) {
+  const key = color + '|' + opacity
+  let m = overrideCache.get(key)
+  if (!m) {
+    m = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(color),
+      metalness: 0.1,
+      roughness: 0.5,
+      side: THREE.DoubleSide,
+      transparent: opacity < 1,
+      opacity,
+      depthWrite: opacity >= 1,
+      polygonOffset: true,
+      polygonOffsetFactor: 1,
+      polygonOffsetUnits: 1,
+    })
+    overrideCache.set(key, m)
+  }
+  return m
 }
 
 function isDescendant(o: THREE.Object3D, ancestor: THREE.Object3D) {

@@ -1,0 +1,15 @@
+[
+  {
+    "id": "plm",
+    "name": "PLM (demo)",
+    "type": "rest",
+    "baseUrl": "${SELF_URL}/mock-plm/api",
+    "list": { "url": "{baseUrl}/parts?search={q}", "itemsPath": "items" },
+    "item": { "url": "{baseUrl}/parts/{id}" },
+    "file": { "url": "{baseUrl}/parts/{id}/content" },
+    "fields": { "id": "number", "name": "cadFile.name", "size": "cadFile.size", "category": "state", "description": "title" },
+    "extra": { "partNumber": "number", "revision": "revision", "state": "state" },
+    "headers": { "Authorization": "Bearer ${PLM_TOKEN}" },
+    "forwardAuth": false
+  }
+]

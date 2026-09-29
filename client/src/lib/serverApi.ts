@@ -1,49 +1,63 @@
-// Server-side model library (Node + SQLite). See /server.
+// Client for the viewer server. Models come from "sources": the built-in database ("local")
+// or connectors configured on the server (PLM systems, document stores, …). See server/connectors.
 export interface ServerModel {
-  id: number
+  id: string | number
   name: string
   format: string
   size: number
   category: string
   description: string
-  created_at: string
+  created_at?: string
+  /** Connector-specific metadata, e.g. { partNumber, revision, state } from a PLM. */
+  extra?: Record<string, unknown>
 }
 
-export async function listServer(q = ''): Promise<ServerModel[]> {
-  const r = await fetch('/api/models' + (q ? `?q=${encodeURIComponent(q)}` : ''))
-  if (!r.ok) throw new Error(`Server returned ${r.status}`)
-  return r.json()
+export interface SourceInfo {
+  id: string
+  name: string
+  type: string
+  canUpload: boolean
 }
 
-export async function fetchServerFile(m: ServerModel, onProgress?: (pct: number) => void): Promise<File> {
-  const r = await fetch(`/api/models/${m.id}/file`)
-  if (!r.ok || !r.body) throw new Error(`Download failed (${r.status})`)
-  const total = Number(r.headers.get('content-length')) || m.size
-  const reader = r.body.getReader()
-  const chunks: Uint8Array[] = []
-  let got = 0
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    chunks.push(value)
-    got += value.length
-    onProgress?.(total ? got / total : 0)
-  }
-  return new File(chunks as BlobPart[], m.name)
+let serverUrl = ''
+let headerProvider: () => Promise<Record<string, string>> = async () => ({})
+
+export function setServerUrl(url: string) {
+  serverUrl = url.replace(/\/+$/, '')
+}
+export function setHeaderProvider(fn: () => Promise<Record<string, string>>) {
+  headerProvider = fn
 }
 
-export async function uploadServer(file: File, category = 'Uploads', description = ''): Promise<ServerModel> {
+const u = (path: string) => serverUrl + path
+
+async function req(path: string, init: RequestInit = {}) {
+  const r = await fetch(u(path), { ...init, headers: { ...(await headerProvider()), ...(init.headers as Record<string, string>) } })
+  if (!r.ok) throw new Error((await r.text().catch(() => '')) || `Server returned ${r.status}`)
+  return r
+}
+
+export async function listSources(): Promise<SourceInfo[]> {
+  return (await req('/api/sources')).json()
+}
+
+export async function listModels(source: string, q = ''): Promise<ServerModel[]> {
+  return (await req(`/api/sources/${encodeURIComponent(source)}/models${q ? `?q=${encodeURIComponent(q)}` : ''}`)).json()
+}
+
+export async function getModel(source: string, id: string | number): Promise<ServerModel> {
+  return (await req(`/api/sources/${encodeURIComponent(source)}/models/${encodeURIComponent(String(id))}`)).json()
+}
+
+export function fileUrl(source: string, id: string | number) {
+  return u(`/api/sources/${encodeURIComponent(source)}/models/${encodeURIComponent(String(id))}/file`)
+}
+
+export async function upload(file: File, category = 'Uploads', description = ''): Promise<ServerModel> {
   const qs = new URLSearchParams({ name: file.name, category, description })
-  const r = await fetch('/api/models?' + qs, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: file,
-  })
-  if (!r.ok) throw new Error((await r.text()) || `Upload failed (${r.status})`)
-  return r.json()
+  return (await req('/api/sources/local/models?' + qs, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file })).json()
 }
 
-export async function deleteServer(id: number): Promise<void> {
-  const r = await fetch(`/api/models/${id}`, { method: 'DELETE' })
-  if (!r.ok) throw new Error(`Delete failed (${r.status})`)
+export async function remove(source: string, id: string | number): Promise<void> {
+  await req(`/api/sources/${encodeURIComponent(source)}/models/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
 }

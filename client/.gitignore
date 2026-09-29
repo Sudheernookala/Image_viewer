@@ -22,5 +22,5 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-public/occt/occt-import-js.js
-public/occt/occt-import-js.wasm
+public/engine/occt-import-js.js
+public/engine/occt-import-js.wasm

@@ -4,25 +4,30 @@ import { copyFileSync, mkdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 // Copies the OpenCascade WASM build (STEP / IGES / BREP reader) into public/occt
-// so the classic web worker in public/occt/occt-worker.js can importScripts() it.
+// so the classic web worker in public/engine/occt-worker.js can importScripts() it.
 function copyOcct(): Plugin {
   return {
     name: 'copy-occt',
     buildStart() {
       const src = resolve(__dirname, 'node_modules/occt-import-js/dist')
-      const dst = resolve(__dirname, 'public/occt')
+      const dst = resolve(__dirname, 'public/engine')
       mkdirSync(dst, { recursive: true })
       for (const f of ['occt-import-js.js', 'occt-import-js.wasm']) copyFileSync(resolve(src, f), resolve(dst, f))
     },
   }
 }
 
+export { copyOcct }
+
 export default defineConfig({
   plugins: [react(), copyOcct()],
   server: {
-    proxy: { '/api': 'http://localhost:3001' },
+    proxy: { '/api': 'http://localhost:3001', '/mock-plm': 'http://localhost:3001', '/examples': 'http://localhost:3001' },
   },
   build: {
     chunkSizeWarningLimit: 1500,
+    rollupOptions: {
+      input: { main: resolve(__dirname, 'index.html'), embed: resolve(__dirname, 'embed.html') },
+    },
   },
 })

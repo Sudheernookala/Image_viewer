@@ -1,10 +1,11 @@
 /* Classic web worker: parses STEP / IGES / BREP with OpenCascade (WASM) off the main thread.
-   The WASM module is initialised once and reused for every file. */
-importScripts('occt-import-js.js');
+   ENGINE_BASE is set when the worker is started from a blob (viewer embedded on another origin). */
+var BASE = self.ENGINE_BASE || '';
+importScripts(BASE + 'occt-import-js.js');
 
 let occtPromise = null;
 function getOcct() {
-  if (!occtPromise) occtPromise = occtimportjs({ locateFile: (p) => p });
+  if (!occtPromise) occtPromise = occtimportjs({ locateFile: (p) => BASE + p });
   return occtPromise;
 }
 

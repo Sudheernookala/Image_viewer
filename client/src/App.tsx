@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Viewer, type Axis, type DisplayMode, type ModelStats, type SectionState, type SelectionInfo, type TreeNode, type ViewName } from './viewer/Viewer'
-import { cancelLoading, loadModelFile, warmUpCadKernel, type LoadedModel, type Quality } from './loaders/loadModel'
+import type { Axis, DisplayMode, ModelStats, SectionState, SelectionInfo, TreeNode, ViewName } from './viewer/Viewer'
+import type { Quality } from './loaders/loadModel'
 import { ACCEPT, SUPPORTED_LIST } from './loaders/formats'
-import { filesFromDrop, splitFiles } from './lib/files'
-import { saveLocal, type LocalEntry } from './lib/localDb'
-import { fetchServerFile, uploadServer, type ServerModel } from './lib/serverApi'
+import { filesFromDrop } from './lib/files'
+import type { LocalEntry } from './lib/localDb'
+import type { ServerModel } from './lib/serverApi'
+import { CadViewer, type CadViewerConfig, type ModelInput } from './sdk/CadViewer'
 import { ModelTree } from './components/ModelTree'
 import { LibraryPanel } from './components/LibraryPanel'
 import { SketchOverlay, type SketchHandle } from './components/SketchOverlay'
@@ -12,9 +13,41 @@ import { Icon } from './components/Icon'
 
 type Loading = { msg: string; t0: number } | null
 
-export default function App() {
+/** Which parts of the UI to show. Embedding hosts usually want less chrome than the standalone app. */
+export interface UiOptions {
+  toolbar?: boolean
+  /** Left panel: parts tree and library */
+  tree?: boolean
+  library?: boolean
+  /** Right panel: model info, selection, section, explode, measurements */
+  properties?: boolean
+  /** Open / Add / Save-to-DB buttons and drag & drop */
+  fileActions?: boolean
+  upload?: boolean
+  title?: string
+  /** Shortcuts work anywhere on the page (standalone app). Off when embedded: only while the viewer has focus. */
+  globalKeys?: boolean
+}
+
+export const UI_PRESETS: Record<'full' | 'compact' | 'minimal' | 'none', UiOptions> = {
+  full: { toolbar: true, tree: true, library: true, properties: true, fileActions: true, upload: true },
+  compact: { toolbar: true, tree: true, library: false, properties: false, fileActions: false, upload: false },
+  minimal: { toolbar: true, tree: false, library: false, properties: false, fileActions: false, upload: false },
+  none: { toolbar: false, tree: false, library: false, properties: false, fileActions: false, upload: false },
+}
+
+export interface AppProps {
+  config?: CadViewerConfig
+  ui?: UiOptions
+  /** Opened once the viewer is ready. */
+  initial?: ModelInput | { source: string; id: string } | null
+  onReady?: (viewer: CadViewer) => void
+}
+
+export default function App({ config, ui = UI_PRESETS.full, initial, onReady }: AppProps) {
+  const rootRef = useRef<HTMLDivElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
-  const viewerRef = useRef<Viewer | null>(null)
+  const viewerRef = useRef<CadViewer | null>(null)
   const sketchRef = useRef<SketchHandle>(null)
   const fileInput = useRef<HTMLInputElement>(null)
   const addInput = useRef<HTMLInputElement>(null)
@@ -27,9 +60,10 @@ export default function App() {
   const [selection, setSelection] = useState<SelectionInfo | null>(null)
   const [stats, setStats] = useState<ModelStats | null>(null)
   const [, setMeasureTick] = useState(0)
-  const [leftTab, setLeftTab] = useState<'tree' | 'library'>('library')
+  const [leftTab, setLeftTab] = useState<'tree' | 'library'>(ui.library ? 'library' : 'tree')
   const [leftOpen, setLeftOpen] = useState(true)
   const [rightOpen, setRightOpen] = useState(true)
+  const showLeft = !!(ui.tree || ui.library)
   const [display, setDisplay] = useState<DisplayMode>('shaded')
   const [projection, setProjection] = useState<'perspective' | 'orthographic'>('perspective')
   const [upAxis, setUpAxis] = useState<'Y' | 'Z'>('Z')
@@ -46,26 +80,57 @@ export default function App() {
   })
   const [explode, setExplode] = useState(0)
   const [dragOver, setDragOver] = useState(false)
-  const [currentFiles, setCurrentFiles] = useState<File[]>([])
+  const [fileCount, setFileCount] = useState(0)
   const [libKey, setLibKey] = useState(0)
   const [showHelp, setShowHelp] = useState(false)
 
   // ---------- viewer lifecycle ----------
   useEffect(() => {
-    const v = new Viewer(hostRef.current!)
-    viewerRef.current = v
-    const off = v.subscribe((e) => {
-      if (e === 'tree') setTree(v.getTree())
-      if (e === 'stats') setStats(v.hasModels() ? v.getStats() : null)
-      if (e === 'selection') setSelection(v.getSelectionInfo())
-      if (e === 'measure') setMeasureTick((n) => n + 1)
-    })
-    warmUpCadKernel()
+    const c = new CadViewer(hostRef.current!, config)
+    viewerRef.current = c
+    const v = c.engine
+    const t0 = { v: 0, n: 0 }
+    const offs = [
+      v.subscribe((e) => {
+        if (e === 'tree') setTree(v.getTree())
+        if (e === 'stats') setStats(v.hasModels() ? v.getStats() : null)
+        if (e === 'selection') setSelection(v.getSelectionInfo())
+        if (e === 'measure') setMeasureTick((n) => n + 1)
+      }),
+      c.on('loadstart', ({ count }) => {
+        t0.v = performance.now()
+        t0.n = count
+        setError(null)
+        setElapsed(0)
+        setLoading({ msg: 'Reading files…', t0: t0.v })
+      }),
+      c.on('progress', ({ message }) => setLoading({ msg: message, t0: t0.v })),
+      c.on('load', () => {
+        setLoading(null)
+        setUpAxis(v.upAxis)
+        setExplode(0)
+        if (ui.tree) setLeftTab('tree')
+        setFileCount(c.getFiles().length)
+        setLibKey((k) => k + 1)
+        flash(`Loaded ${t0.n} file${t0.n > 1 ? 's' : ''} in ${((performance.now() - t0.v) / 1000).toFixed(2)} s`)
+      }),
+      c.on('error', ({ message }) => {
+        setLoading(null)
+        setError(message)
+      }),
+      c.on('clear', () => setFileCount(0)),
+    ]
+    onReady?.(c)
+    if (initial) {
+      const i = initial as { source?: string; id?: string }
+      ;(i.source && i.id ? c.openFromSource(i.source, i.id) : c.load(initial as ModelInput)).catch(() => {})
+    }
     return () => {
-      off()
-      v.dispose()
+      offs.forEach((o) => o())
+      c.destroy()
       viewerRef.current = null
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -80,92 +145,24 @@ export default function App() {
   }
 
   // ---------- loading ----------
-  const openFiles = useCallback(
-    async (files: File[], replace: boolean, remember = true) => {
-      const v = viewerRef.current
-      if (!v) return
-      const { models, resources, ignored } = splitFiles(files)
-      if (!models.length) {
-        setError(`No supported 3D file found${ignored.length ? ` (got ${ignored.map((f) => f.name).join(', ')})` : ''}.\nSupported: ${SUPPORTED_LIST}`)
-        return
-      }
-      setError(null)
-      const t0 = performance.now()
-      setElapsed(0)
-      setLoading({ msg: 'Reading files…', t0 })
-      const loaded: LoadedModel[] = []
-      const failed: string[] = []
-      for (const f of models) {
-        try {
-          loaded.push(await loadModelFile(f, resources, quality, (msg) => setLoading({ msg, t0 })))
-        } catch (e) {
-          const msg = (e as Error).message
-          if (msg === 'Cancelled') return setLoading(null)
-          failed.push(`${f.name}: ${msg}`)
-        }
-      }
-      setLoading({ msg: 'Building scene…', t0 })
-      await new Promise((r) => setTimeout(r, 0))
-      if (loaded.length) {
-        v.setModels(loaded, replace)
-        setUpAxis(v.upAxis)
-        setExplode(0)
-        setLeftTab('tree')
-        setCurrentFiles((prev) => (replace ? models : [...prev, ...models]))
-        const ms = performance.now() - t0
-        flash(`Loaded ${loaded.length} file${loaded.length > 1 ? 's' : ''} in ${(ms / 1000).toFixed(2)} s`)
-        if (remember) {
-          for (const m of models) {
-            const companions = [...resources.values()].filter((r) => r !== m && !models.includes(r))
-            saveLocal([m, ...companions]).then(() => setLibKey((k) => k + 1)).catch(() => {})
-          }
-        }
-      }
-      if (failed.length) setError(failed.join('\n'))
-      setLoading(null)
-    },
-    [quality],
-  )
-
-  const openServer = async (m: ServerModel) => {
-    const t0 = performance.now()
-    try {
-      setLoading({ msg: `Downloading ${m.name}…`, t0 })
-      const f = await fetchServerFile(m, (p) => setLoading({ msg: `Downloading ${m.name}… ${Math.round(p * 100)}%`, t0 }))
-      await openFiles([f], true, false)
-    } catch (e) {
-      setLoading(null)
-      setError((e as Error).message)
-    }
-  }
-
-  const openLocal = (e: LocalEntry) => openFiles(e.files, true, false)
-
-  // ?url=https://…/model.step  → open directly
-  useEffect(() => {
-    const url = new URLSearchParams(location.search).get('url')
-    if (!url) return
-    ;(async () => {
-      try {
-        setLoading({ msg: `Downloading ${url}…`, t0: performance.now() })
-        const r = await fetch(url)
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        const name = decodeURIComponent(new URL(url, location.href).pathname.split('/').pop() || 'model')
-        await openFiles([new File([await r.blob()], name)], true)
-      } catch (e) {
-        setLoading(null)
-        setError(`Could not open ${url}: ${(e as Error).message}`)
-      }
-    })()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  const openFiles = useCallback((files: File[], replace: boolean) => {
+    const c = viewerRef.current
+    if (!c) return
+    c.load(files, { replace }).catch((e) => {
+      if ((e as Error).message.startsWith('No supported')) setError(`${(e as Error).message}\nSupported: ${SUPPORTED_LIST}`)
+    })
   }, [])
 
+  const openServer = (source: string, m: ServerModel) => viewerRef.current?.openFromSource(source, m.id).catch(() => {})
+  const openLocal = (e: LocalEntry) => openFiles(e.files, true)
+
   const saveToServer = async () => {
-    if (!currentFiles.length) return
+    const c = viewerRef.current
+    if (!c || !fileCount) return
     try {
-      for (const f of currentFiles) await uploadServer(f)
+      await c.saveToServer()
       setLibKey((k) => k + 1)
-      flash(`Saved ${currentFiles.length} file(s) to the server database`)
+      flash(`Saved ${fileCount} file(s) to the server database`)
     } catch (e) {
       setError('Upload failed: ' + (e as Error).message)
     }
@@ -175,12 +172,13 @@ export default function App() {
   const onDrop = async (e: React.DragEvent) => {
     e.preventDefault()
     setDragOver(false)
+    if (!ui.fileActions) return
     const files = await filesFromDrop(e.dataTransfer)
     openFiles(files, !e.shiftKey)
   }
 
   // ---------- tool helpers ----------
-  const v = () => viewerRef.current!
+  const v = () => viewerRef.current!.engine
   const changeDisplay = (m: DisplayMode) => (setDisplay(m), v().setDisplayMode(m))
   const changeSection = (axis: Axis, s: Partial<SectionState>) => {
     setSection((prev) => ({ ...prev, [axis]: { ...prev[axis], ...s } }))
@@ -203,13 +201,12 @@ export default function App() {
     a.download = (stats?.files[0]?.name.replace(/\.[^.]+$/, '') || 'view') + '.png'
     a.click()
   }
-  const fullscreen = () => (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen())
+  const fullscreen = () => (document.fullscreenElement ? document.exitFullscreen() : rootRef.current?.requestFullscreen())
 
-  // ---------- keyboard shortcuts ----------
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
+  // ---------- keyboard shortcuts (only while the viewer has focus: never hijack the host app) ----------
+  const onKey = (e: KeyboardEvent | React.KeyboardEvent) => {
       if (isTextField(e.target) || e.ctrlKey || e.metaKey || e.altKey) return
-      const vw = viewerRef.current
+      const vw = viewerRef.current?.engine
       if (!vw) return
       if (e.key === 'Escape') {
         vw.select(null)
@@ -231,21 +228,31 @@ export default function App() {
       else if (k === 'e') changeDisplay(display === 'edges' ? 'shaded' : 'edges')
       else if (k === 'x') changeDisplay(display === 'xray' ? 'shaded' : 'xray')
       else if (k === '?') setShowHelp((s) => !s)
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  })
+  }
 
-  const measurements = viewerRef.current?.measurements ?? []
+  const onKeyRef = useRef(onKey)
+  onKeyRef.current = onKey
+  useEffect(() => {
+    if (!ui.globalKeys) return
+    const h = (e: KeyboardEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) onKeyRef.current(e)
+    }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [ui.globalKeys])
+
+  const measurements = viewerRef.current?.engine.measurements ?? []
   const hasModel = !!stats
 
   return (
-    <div className="app">
+    <div className="app" ref={rootRef} tabIndex={-1} onKeyDown={onKey}>
       {/* ---------------- toolbar ---------------- */}
+      {ui.toolbar && (
       <header className="toolbar">
         <div className="brand">
-          <Icon name="cube" size={20} /> <span>CAD 3D Viewer</span>
+          <Icon name="cube" size={20} /> <span>{ui.title ?? 'CAD 3D Viewer'}</span>
         </div>
+        {ui.fileActions && (
         <div className="group">
           <button className="primary" onClick={() => fileInput.current?.click()} title="Open files (replaces scene)">
             <Icon name="open" /> Open
@@ -253,15 +260,25 @@ export default function App() {
           <button onClick={() => addInput.current?.click()} disabled={!hasModel} title="Add files to the current scene">
             <Icon name="plus" /> Add
           </button>
-          <button onClick={saveToServer} disabled={!currentFiles.length} title="Save the open file(s) to the server database">
-            <Icon name="upload" /> Save to DB
-          </button>
-          <select value={quality} onChange={(e) => setQuality(e.target.value as Quality)} title="STEP/IGES tessellation quality (applies to next load)">
+          {ui.upload && (
+            <button onClick={saveToServer} disabled={!fileCount} title="Save the open file(s) to the server database">
+              <Icon name="upload" /> Save to DB
+            </button>
+          )}
+          <select
+            value={quality}
+            onChange={(e) => {
+              setQuality(e.target.value as Quality)
+              viewerRef.current?.setQuality(e.target.value as Quality)
+            }}
+            title="STEP/IGES tessellation quality (applies to next load)"
+          >
             <option value="draft">Draft mesh (fastest)</option>
             <option value="normal">Normal mesh</option>
             <option value="fine">Fine mesh (slowest)</option>
           </select>
         </div>
+        )}
         <div className="group">
           {(
             [
@@ -327,13 +344,16 @@ export default function App() {
           </button>
         </div>
       </header>
+      )}
 
       <input ref={fileInput} type="file" multiple accept={ACCEPT} hidden onChange={(e) => (openFiles([...(e.target.files ?? [])], true), (e.target.value = ''))} />
       <input ref={addInput} type="file" multiple accept={ACCEPT} hidden onChange={(e) => (openFiles([...(e.target.files ?? [])], false), (e.target.value = ''))} />
 
       <main className="body">
         {/* ---------------- left panel ---------------- */}
+        {showLeft && (
         <aside className={'panel left' + (leftOpen ? '' : ' closed')}>
+          {ui.tree && ui.library && (
           <div className="tabs">
             <button className={leftTab === 'tree' ? 'active' : ''} onClick={() => setLeftTab('tree')}>
               <Icon name="tree" size={15} /> Parts
@@ -342,7 +362,8 @@ export default function App() {
               <Icon name="db" size={15} /> Library
             </button>
           </div>
-          {leftTab === 'tree' ? (
+          )}
+          {leftTab === 'tree' || !ui.library ? (
             <ModelTree
               tree={tree}
               selectedId={selection?.id ?? null}
@@ -352,12 +373,15 @@ export default function App() {
               onIsolate={(id) => v().isolate(id)}
             />
           ) : (
-            <LibraryPanel onOpenServer={openServer} onOpenLocal={openLocal} refreshKey={libKey} />
+            <LibraryPanel onOpenServer={openServer} onOpenLocal={openLocal} refreshKey={libKey} showRecent={!!config?.rememberRecent} />
           )}
         </aside>
+        )}
+        {showLeft && (
         <button className="collapse left" onClick={() => setLeftOpen(!leftOpen)} title="Toggle panel">
           {leftOpen ? '‹' : '›'}
         </button>
+        )}
 
         {/* ---------------- viewport ---------------- */}
         <section
@@ -369,13 +393,17 @@ export default function App() {
           <div ref={hostRef} className="canvas-host" />
           <SketchOverlay ref={sketchRef} active={sketching} onClose={() => setSketching(false)} onChange={setSketchCount} />
 
-          {!hasModel && !loading && (
+          {!hasModel && !loading && ui.fileActions && (
             <div className="welcome">
               <Icon name="cube" size={54} />
               <h2>Drop 3D files or folders here</h2>
               <p>
                 STEP, IGES, STL, OBJ, glTF, FBX, 3MF, PLY and more. <br />
-                Or pick a sample from the <b>Library</b> (server database) on the left.
+                {ui.library && (
+                  <>
+                    Or pick a model from the <b>Library</b> on the left.
+                  </>
+                )}
               </p>
               <button className="primary" onClick={() => fileInput.current?.click()}>
                 <Icon name="open" /> Browse files
@@ -412,7 +440,7 @@ export default function App() {
                 <div>{loading.msg}</div>
                 <small>{elapsed.toFixed(1)} s</small>
               </div>
-              <button onClick={() => (cancelLoading(), setLoading(null))}>Cancel</button>
+              <button onClick={() => (viewerRef.current?.cancel(), setLoading(null))}>Cancel</button>
             </div>
           )}
           {error && (
@@ -425,10 +453,13 @@ export default function App() {
           {showHelp && <HelpCard onClose={() => setShowHelp(false)} />}
         </section>
 
+        {ui.properties && (
         <button className="collapse right" onClick={() => setRightOpen(!rightOpen)} title="Toggle panel">
           {rightOpen ? '›' : '‹'}
         </button>
+        )}
         {/* ---------------- right panel ---------------- */}
+        {ui.properties && (
         <aside className={'panel right' + (rightOpen ? '' : ' closed')}>
           {stats ? (
             <>
@@ -553,6 +584,7 @@ export default function App() {
             </div>
           )}
         </aside>
+        )}
       </main>
     </div>
   )

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CAD viewer – integration examples</title>
+<style>
+  body { margin: 0; font: 15px/1.6 system-ui, sans-serif; color: #1d2433; background: #f4f6f9; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 24px 16px 60px; }
+  a { color: #1f6feb; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 12px 14px; border-radius: 8px; overflow: auto; font-size: 13px; }
+  li { margin: 6px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Integration examples</h1>
+  <ul>
+    <li><a href="plm-portal.html">PLM portal</a>: iframe + postMessage. The BOM table and the 3D view are linked both ways, parts are coloured by lifecycle state, and a snapshot is sent back to the host.</li>
+    <li><a href="web-component.html">Web component</a>: <code>&lt;cad-viewer&gt;</code> with its JavaScript API and events.</li>
+    <li><a href="../embed.html?source=plm&id=CAR-0001&ui=minimal">Bare embed URL</a>: what a PLM "Open in 3D" link or tab would point to.</li>
+  </ul>
+
+  <h2>Angular</h2>
+<pre>// app.module.ts (or standalone component): allow custom elements
+schemas: [CUSTOM_ELEMENTS_SCHEMA]
+
+// index.html
+&lt;script type="module" src="https://viewer.example.com/sdk/cad-viewer.js"&gt;&lt;/script&gt;
+
+// part-viewer.component.html
+&lt;cad-viewer #cad source="plm" [attr.model-id]="partNumber" ui="compact"
+            (cad-select)="onSelect($event.detail.part)" style="height:600px"&gt;&lt;/cad-viewer&gt;
+
+// part-viewer.component.ts
+@ViewChild('cad') cad!: ElementRef;
+ngAfterViewInit() { this.cad.nativeElement.headers = () =&gt; ({ Authorization: 'Bearer ' + this.auth.token }) }
+highlight(names: string[]) { this.cad.nativeElement.viewer?.isolate(names) }</pre>
+
+  <h2>React</h2>
+<pre>// once: &lt;script type="module" src="https://viewer.example.com/sdk/cad-viewer.js"&gt;
+function PartViewer({ partNumber, onSelect }) {
+  const ref = useRef(null)
+  useEffect(() =&gt; {
+    const el = ref.current
+    const h = (e) =&gt; onSelect(e.detail.part)
+    el.addEventListener('cad-select', h)
+    return () =&gt; el.removeEventListener('cad-select', h)
+  }, [onSelect])
+  return &lt;cad-viewer ref={ref} source="plm" model-id={partNumber} ui="compact" style={{ height: 600 }} /&gt;
+}</pre>
+
+  <h2>Plain JavaScript (no UI, full control)</h2>
+<pre>import { mountViewer } from 'https://viewer.example.com/sdk/cad-viewer.js'
+const viewer = await mountViewer(document.getElementById('box'), { ui: 'none', headers: () =&gt; ({ Authorization: token }) })
+await viewer.load({ url: '/my-dms/files/4711', name: 'housing.step' })
+viewer.on('select', ({ part }) =&gt; console.log(part?.name))
+viewer.colorize({ 'Screw_*': '#e11d48' })</pre>
+
+  <h2>iframe (any tool that can show a web page)</h2>
+<pre>&lt;iframe id="v" src="https://viewer.example.com/embed.html?source=plm&amp;id=PRT-1001&amp;ui=compact"&gt;&lt;/iframe&gt;
+&lt;script src="https://viewer.example.com/sdk/cad-viewer-host.js"&gt;&lt;/script&gt;
+&lt;script&gt;
+  const viewer = new CadViewerFrame(document.getElementById('v'))
+  viewer.on('select', ({ part }) =&gt; showDetails(part?.name))
+  viewer.isolate(['Engine_*'])
+&lt;/script&gt;</pre>
+</div>
+</body>
+</html>

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>&lt;cad-viewer&gt; web component demo</title>
+<style>
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #f4f6f9; color: #1d2433; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 16px; }
+  cad-viewer { height: 560px; border-radius: 8px; overflow: hidden; border: 1px solid #d9dee7; }
+  .bar { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0; }
+  button { border: 1px solid #d9dee7; background: #fff; border-radius: 6px; padding: 5px 10px; cursor: pointer; font: inherit; }
+  pre { background: #fff; border: 1px solid #d9dee7; border-radius: 8px; padding: 10px; font-size: 12px; max-height: 180px; overflow: auto; }
+  code { background: #e9edf3; padding: 1px 4px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>&lt;cad-viewer&gt; — one tag in any web app</h2>
+  <p>This page loads <code>/sdk/cad-viewer.js</code> and uses the element below. The same tag works in Angular, React, Vue or plain HTML.</p>
+
+  <cad-viewer id="v" source="plm" model-id="CAR-0001" ui="compact" title="Web component"></cad-viewer>
+
+  <div class="bar">
+    <button data-a="wheels">Isolate wheels</button>
+    <button data-a="engine">Zoom to engine</button>
+    <button data-a="paint">Paint body blue</button>
+    <button data-a="reset">Reset</button>
+    <button data-a="xray">X-ray</button>
+    <button data-a="stl">Load STL from viewer DB</button>
+    <button data-a="parts">List parts</button>
+  </div>
+  <pre id="log"></pre>
+</div>
+<script type="module">
+  const VIEWER = new URLSearchParams(location.search).get('viewer') || location.origin
+  await import(VIEWER + '/sdk/cad-viewer.js') // registers <cad-viewer>
+  const el = document.getElementById('v')
+  const log = (m) => (document.getElementById('log').textContent = m + '\n' + document.getElementById('log').textContent)
+  for (const ev of ['cad-ready', 'cad-load', 'cad-select', 'cad-error']) {
+    el.addEventListener(ev, (e) => log(`${ev}: ${JSON.stringify(ev === 'cad-ready' ? 'ok' : e.detail).slice(0, 200)}`))
+  }
+  document.querySelector('.bar').onclick = async (e) => {
+    const v = el.viewer, a = e.target.dataset.a
+    if (!v || !a) return
+    if (a === 'wheels') v.isolate('Wheel_*')
+    if (a === 'engine') v.zoomTo('Engine_*')
+    if (a === 'paint') v.colorize({ 'Body_*': '#2563eb', 'Mirror_*': '#2563eb' })
+    if (a === 'reset') { v.resetColors(); v.showAll(); v.setDisplayMode('shaded'); v.fit() }
+    if (a === 'xray') v.setDisplayMode('xray')
+    if (a === 'stl') {
+      const [m] = await v.listModels('local', 'engine_block.stl')
+      await v.openFromSource('local', m.id)
+    }
+    if (a === 'parts') log(v.getParts().filter((p) => p.isMesh).map((p) => p.name).join(', '))
+  }
+</script>
+</body>
+</html>

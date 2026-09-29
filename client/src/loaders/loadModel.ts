@@ -47,9 +47,36 @@ const GLASS_RE = /glass|window|windscreen|windshield|lens/i
 // ---------------- workers ----------------
 
 let occtWorker: Worker | null = null
-let meshWorker: Worker | null = null
+let stlWorker: Worker | null = null
 let reqId = 0
 const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>()
+
+/** Where the engine files (OpenCascade WASM + workers) are served from. Absolute URL, ends with '/'. */
+let assetsBase = new URL(import.meta.env.BASE_URL + 'engine/', location.href).href
+let dracoPath = 'https://www.gstatic.com/draco/versioned/decoders/1.5.7/'
+
+export function setEngineBaseUrl(url: string) {
+  assetsBase = new URL(url.endsWith('/') ? url : url + '/', location.href).href
+}
+export function setDracoDecoderPath(url: string) {
+  dracoPath = url
+}
+
+/** Browsers refuse `new Worker(url)` across origins. When the viewer is embedded from another
+ *  domain we start a tiny same-origin blob worker that importScripts() the real one. */
+function makeWorker(file: string): Worker {
+  const url = assetsBase + file
+  const w =
+    new URL(url).origin === location.origin
+      ? new Worker(url)
+      : new Worker(
+          URL.createObjectURL(
+            new Blob([`self.ENGINE_BASE=${JSON.stringify(assetsBase)};importScripts(${JSON.stringify(url)});`], { type: 'text/javascript' }),
+          ),
+        )
+  w.onmessage = onWorkerMessage
+  return w
+}
 
 function onWorkerMessage(ev: MessageEvent) {
   const p = pending.get(ev.data.id)
@@ -60,19 +87,11 @@ function onWorkerMessage(ev: MessageEvent) {
 }
 
 function getOcctWorker(): Worker {
-  if (!occtWorker) {
-    occtWorker = new Worker(import.meta.env.BASE_URL + 'occt/occt-worker.js')
-    occtWorker.onmessage = onWorkerMessage
-  }
-  return occtWorker
+  return (occtWorker ??= makeWorker('occt-worker.js'))
 }
 
-function getMeshWorker(): Worker {
-  if (!meshWorker) {
-    meshWorker = new Worker(new URL('./meshWorker.ts', import.meta.url), { type: 'module' })
-    meshWorker.onmessage = onWorkerMessage
-  }
-  return meshWorker
+function getStlWorker(): Worker {
+  return (stlWorker ??= makeWorker('stl-worker.js'))
 }
 
 function callWorker<T>(w: Worker, msg: Record<string, unknown>, transfer: Transferable[] = []): Promise<T> {
@@ -93,8 +112,8 @@ export function cancelLoading() {
   for (const [, p] of pending) p.reject(new Error('Cancelled'))
   pending.clear()
   occtWorker?.terminate()
-  meshWorker?.terminate()
-  occtWorker = meshWorker = null
+  stlWorker?.terminate()
+  occtWorker = stlWorker = null
 }
 
 // ---------------- CAD (OpenCascade) ----------------
@@ -265,18 +284,18 @@ async function loadMesh(file: File, ext: string, resources: Map<string, File>): 
   const { manager, dispose } = makeManager(resources)
   try {
     switch (ext) {
-      case 'stl':
-      case 'ply': {
+      case 'stl': {
         const buffer = await file.arrayBuffer()
-        const res = await callWorker<{ attrs: Record<string, { array: Float32Array; itemSize: number }>; index: Uint32Array | null }>(
-          getMeshWorker(),
-          { format: ext, buffer },
-          [buffer],
-        )
+        const res = await callWorker<{ position: Float32Array; normal: Float32Array }>(getStlWorker(), { buffer }, [buffer])
         const g = new THREE.BufferGeometry()
-        for (const [k, v] of Object.entries(res.attrs)) g.setAttribute(k, new THREE.BufferAttribute(v.array, v.itemSize))
-        if (res.index) g.setIndex(new THREE.BufferAttribute(res.index, 1))
-        if (ext === 'ply' && !res.index && !res.attrs.normal) return pointsOf(g, file.name)
+        g.setAttribute('position', new THREE.BufferAttribute(res.position, 3))
+        g.setAttribute('normal', new THREE.BufferAttribute(res.normal, 3))
+        return geometryToObject(g, file.name)
+      }
+      case 'ply': {
+        const { PLYLoader } = await import('three/examples/jsm/loaders/PLYLoader.js')
+        const g = new PLYLoader(manager).parse(await file.arrayBuffer())
+        if (!g.index && !g.getAttribute('normal')) return pointsOf(g, file.name)
         return geometryToObject(g, file.name)
       }
       case 'obj': {
@@ -301,7 +320,7 @@ async function loadMesh(file: File, ext: string, resources: Map<string, File>): 
         const { DRACOLoader } = await import('three/examples/jsm/loaders/DRACOLoader.js')
         const { MeshoptDecoder } = await import('three/examples/jsm/libs/meshopt_decoder.module.js')
         const loader = new GLTFLoader(manager)
-        loader.setDRACOLoader(new DRACOLoader().setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/'))
+        loader.setDRACOLoader(new DRACOLoader().setDecoderPath(dracoPath))
         loader.setMeshoptDecoder(MeshoptDecoder)
         const data = ext === 'glb' ? await file.arrayBuffer() : await file.text()
         const gltf = await loader.parseAsync(data, '')
@@ -376,6 +395,28 @@ async function loadMesh(file: File, ext: string, resources: Map<string, File>): 
 }
 
 // ---------------- entry point ----------------
+
+/** Guesses the format from the file's first bytes. PLM download URLs often have no file extension. */
+export async function sniffExtension(blob: Blob): Promise<string | null> {
+  const head = new Uint8Array(await blob.slice(0, 512).arrayBuffer())
+  const text = new TextDecoder('latin1').decode(head)
+  if (text.startsWith('ISO-10303-21')) return 'step'
+  if (text.startsWith('glTF')) return 'glb'
+  if (text.startsWith('ply')) return 'ply'
+  if (text.startsWith('solid') && /facet|endsolid/.test(text)) return 'stl'
+  if (/^Kaydara FBX Binary/.test(text) || text.startsWith('; FBX')) return 'fbx'
+  if (text.startsWith('#VRML')) return 'wrl'
+  if (text.startsWith('PK')) return '3mf'
+  if (/^.{72}S[\s0]*1\s*$/.test(text.split(/\r?\n/)[0] ?? '')) return 'iges'
+  if (text.includes('"asset"') && text.trimStart().startsWith('{')) return 'gltf'
+  if (/<COLLADA/i.test(text)) return 'dae'
+  if (/^(v|vn|vt|f|o|g|mtllib)\s/m.test(text)) return 'obj'
+  if (blob.size >= 84) {
+    const n = new DataView(head.buffer).getUint32(80, true)
+    if (blob.size === 84 + n * 50) return 'stl'
+  }
+  return null
+}
 
 export async function loadModelFile(
   file: File,
