@@ -1,0 +1,15 @@
+{
+  "name": "cad-3d-viewer",
+  "private": true,
+  "description": "Fast browser-based viewer for STEP, IGES, STL, OBJ, glTF and other 3D formats",
+  "scripts": {
+    "postinstall": "npm --prefix client install",
+    "dev": "concurrently -k -n server,client -c blue,green \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
+    "build": "npm --prefix client run build",
+    "start": "npm --prefix server start",
+    "samples": "python3 scripts/generate_car.py"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
